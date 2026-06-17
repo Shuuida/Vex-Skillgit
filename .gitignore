@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.qdrant_data
+.vex_data
+
+# Others
+huey_queue.db
+temp_uploads/
