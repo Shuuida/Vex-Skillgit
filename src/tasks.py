@@ -3,7 +3,7 @@ import sys
 import uuid
 import ollama
 import hashlib
-from qdrant_client.models import PointStruct
+from qdrant_client.models import PointStruct, PointIdsList
 import urllib.request
 import urllib.error
 
@@ -117,6 +117,50 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             print(f"[Worker Thread] Cleanup: Temporary file removed.", file=sys.stderr)
+
+def process_deletion_task(file_path: str, tenant_id: str, skill_id: str):
+        """
+        Erase the phantom memory of a deleted file on GitHub
+        deleting their vectors in Qdrant and their pointers in SQLite.
+        """
+        print(f"[Worker Thread] Task received. Starting PRUNING for {file_path} (Tenant: {tenant_id})...", file=sys.stderr)
+        
+        db = SessionLocal()
+        vector_db = get_db_client()
+        
+        try:
+            # Since the files were saved with temporary names (e.g., gh_87904db_main.py),
+            # LIKE is used to find any fragment that ends with the name of this file.
+            filename_only = os.path.basename(file_path)
+            
+            records = db.query(ChunkRecord).filter(
+                ChunkRecord.tenant_id == tenant_id,
+                ChunkRecord.skill_id == skill_id,
+                ChunkRecord.file_path.like(f"%{filename_only}")
+            ).all()
+            
+            if not records:
+                print(f"[Worker Thread] Pruning skipped. No ghost chunks found for {file_path}.", file=sys.stderr)
+                return
+                
+            # It extract the exact UUIDs associated with the vector database
+            chunk_ids = [record.chunk_id for record in records]
+            
+            vector_db.delete(
+                collection_name="vex_skills",
+                points_selector=PointIdsList(points=chunk_ids)
+            )          
+            for record in records:
+                db.delete(record)
+                
+            db.commit()
+            print(f"[Worker Thread] SUCCESS: Annihilated {len(chunk_ids)} phantom chunks of {file_path}.", file=sys.stderr)
+            
+        except Exception as e:
+            db.rollback()
+            print(f"[Worker Thread] ERROR pruning file {file_path}: {str(e)}", file=sys.stderr)
+        finally:
+            db.close()
 
 def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str):
     """

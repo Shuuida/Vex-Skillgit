@@ -13,7 +13,7 @@ from src.core.chunker import ast_chunker
 from src.db.relational import init_relational_db, SessionLocal, ChunkRecord, SkillRecord
 from src.api.schemas import DocumentUploadResponse, SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
-from src.tasks import process_ingestion_task, process_github_files_task
+from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task
 
 # Pydantic schema for the testing endpoint
 class ParseRequest(BaseModel):
@@ -191,7 +191,8 @@ async def search_skill(request: SearchRequest):
             collection_name="vex_skills",
             query=query_vector,
             query_filter=search_filter,
-            limit=request.limit
+            limit=request.limit,
+            score_threshold=0.70
         )
         # Extract the list of hits from the response wrapper
         qdrant_results = qdrant_response.points
@@ -253,23 +254,34 @@ async def github_webhook(
     for commit in payload.commits:
         commit_hash = commit.id 
         files_to_download = commit.added + commit.modified
+        files_to_delete = commit.removed
+
+        # The skill will always be associated with this repository
+        skill_id = f"repo_{repo_name}"
         
         if files_to_download:
-            # The skill is dynamically associated with the specific repository
-            skill_id = f"repo_{repo_name}" 
+                background_tasks.add_task(
+                    process_github_files_task,
+                    repo_full_name,
+                    commit_hash,
+                    files_to_download,
+                    dynamic_tenant_id, 
+                    skill_id
+                )
             
-            background_tasks.add_task(
-                process_github_files_task,
-                repo_full_name,
-                commit_hash,
-                files_to_download,
-                dynamic_tenant_id, 
-                skill_id
-            )
-        
+        if files_to_delete:
+            for file_path in files_to_delete:
+                background_tasks.add_task(
+                    process_deletion_task,
+                    file_path,
+                    dynamic_tenant_id,
+                    skill_id
+                )
+            
         processed_commits.append({
             "hash": commit_hash,
-            "files_changed": len(files_to_download)
+            "files_changed": len(files_to_download),
+            "files_removed": len(files_to_delete)
         })
 
     return JSONResponse(
