@@ -43,8 +43,15 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
         for chunk in raw_chunks:
             pointer_id = str(uuid.uuid4())
             chunk_content = chunk["content"]
+            dependencies = chunk.get("dependencies", [])
             
             chunk_hash = hashlib.sha256(chunk_content.encode('utf-8')).hexdigest()
+
+            if dependencies:
+                graph_context = f"# [GraphRAG] Calls/Dependencies: {', '.join(dependencies)}\n"
+                enriched_content = graph_context + chunk_content
+            else:
+                enriched_content = chunk_content
             
             # Query the Cognitive Cache (SQLite)
             existing_record = db.query(ChunkRecord).filter(
@@ -80,7 +87,7 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
                 file_path=filename,
                 file_extension=file_extension,
                 ast_node_type=chunk["ast_node_type"],
-                raw_content=chunk["content"],
+                raw_content=enriched_content,
                 version=version,
                 chunk_hash=chunk_hash
             )
@@ -94,7 +101,8 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
                     "skill_id": skill_id,
                     "file_path": filename,
                     "ast_node_type": chunk["ast_node_type"],
-                    "version": version
+                    "version": version,
+                    "dependencies": dependencies
                 }
             )
             qdrant_points.append(point)

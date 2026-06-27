@@ -14,3 +14,4 @@ wheels/
 # Others
 huey_queue.db
 temp_uploads/
+test_mcp.py

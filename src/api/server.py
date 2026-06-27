@@ -3,7 +3,7 @@ import uuid
 import shutil
 import ollama
 import re
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -14,6 +14,7 @@ from src.db.relational import init_relational_db, SessionLocal, ChunkRecord, Ski
 from src.api.schemas import DocumentUploadResponse, SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task
+from src.api.security import verify_api_key
 
 # Pydantic schema for the testing endpoint
 class ParseRequest(BaseModel):
@@ -71,7 +72,7 @@ async def test_ast_parsing(request: ParseRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.post("/skills/create", response_model=SkillResponse)
+@app.post("/skills/create", response_model=SkillResponse, dependencies=[Depends(verify_api_key)])
 async def create_skill(request: SkillCreateRequest):
     """Registers a new Skill in the relational database."""
     db = SessionLocal()
@@ -104,7 +105,7 @@ async def create_skill(request: SkillCreateRequest):
     finally:
         db.close()
 
-@app.get("/skills/{skill_id}", response_model=SkillResponse)
+@app.get("/skills/{skill_id}", response_model=SkillResponse, dependencies=[Depends(verify_api_key)])
 async def get_skill(skill_id: str):
     """Retrieves the metadata of a specific Skill."""
     db = SessionLocal()
@@ -126,7 +127,7 @@ async def get_skill(skill_id: str):
     finally:
         db.close()
 
-@app.post("/documents/upload")
+@app.post("/documents/upload", dependencies=[Depends(verify_api_key)])
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -159,7 +160,7 @@ async def upload_document(
         }
     )
 
-@app.post("/skills/search", response_model=SearchResponse)
+@app.post("/skills/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
 async def search_skill(request: SearchRequest):
     """
     Vectorizes the query, searches Qdrant with governance filters, 
@@ -167,7 +168,8 @@ async def search_skill(request: SearchRequest):
     """
     # Vectorize the semantic query
     try:
-        response = ollama.embeddings(model="nomic-embed-text", prompt=request.query)
+        enhanced_query = f"source code, function definition, class, method, technical implementation of: {request.query}"
+        response = ollama.embeddings(model="nomic-embed-text", prompt=enhanced_query)
         query_vector = response["embedding"]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
@@ -192,7 +194,7 @@ async def search_skill(request: SearchRequest):
             query=query_vector,
             query_filter=search_filter,
             limit=request.limit,
-            score_threshold=0.70
+            score_threshold=0.55
         )
         # Extract the list of hits from the response wrapper
         qdrant_results = qdrant_response.points

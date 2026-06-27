@@ -32,6 +32,25 @@ class ASTChunker:
             return ["paragraph", "atx_heading", "fenced_code_block", "list"]
         return []
 
+    def _extract_dependencies(self, node: Node) -> list[str]:
+        """Extract function calls to map dependencies."""
+        deps = set()
+        def walk(n: Node):
+            # Identifies generic function calls in Python, JS, TS, Go
+            if "call" in n.type:
+                for child in n.children:
+                    if child.type == "identifier":
+                        deps.add(child.text.decode("utf8"))
+                    elif child.type == "attribute":
+                        # To extract methods: object.method() -> extracts "method"
+                        for sub in child.children:
+                            if sub.type == "identifier" and sub != child.children[0]:
+                                deps.add(sub.text.decode("utf8"))
+            for c in n.children:
+                walk(c)
+        walk(node)
+        return list(deps)
+
     def chunk_source_code(self, source_code: str, file_extension: str) -> list[dict]:
         if file_extension not in self.languages:
             raise ValueError(f"Language for extension '{file_extension}' is not supported yet.")
@@ -47,7 +66,8 @@ class ASTChunker:
                     "ast_node_type": node.type,
                     "content": node.text.decode("utf8"),
                     "start_line": node.start_point[0] + 1,
-                    "end_line": node.end_point[0] + 1
+                    "end_line": node.end_point[0] + 1,
+                    "dependencies": self._extract_dependencies(node)
                 })
             
             for child in node.children:
