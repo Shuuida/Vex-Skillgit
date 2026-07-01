@@ -11,7 +11,8 @@ wheels/
 .qdrant_data
 .vex_data
 
+# SQLite artifacts
+*.db
+
 # Others
-huey_queue.db
 temp_uploads/
-test_mcp.py

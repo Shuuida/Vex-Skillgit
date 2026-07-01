@@ -1,0 +1,3 @@
+[tool.pyrefly]
+python_interpreter = "C:\\Vex\\.venv\\Scripts\\python.exe"
+search_path = ["."]

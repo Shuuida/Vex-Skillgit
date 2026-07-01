@@ -1,5 +1,6 @@
 import tree_sitter_python as tspython
 import tree_sitter_typescript as tstypescript
+import tree_sitter_javascript as tsjavascript
 import tree_sitter_go as tsgo
 import tree_sitter_yaml as tsyaml
 import tree_sitter_markdown as tsmd
@@ -10,18 +11,19 @@ class ASTChunker:
         self.languages = {
             ".py": Language(tspython.language()),
             ".ts": Language(tstypescript.language_typescript()),
-            ".js": Language(tstypescript.language_typescript()),
+            ".tsx": Language(tstypescript.language_tsx()),
+            ".js": Language(tsjavascript.language()),
+            ".jsx": Language(tstypescript.language_tsx()),
             ".go": Language(tsgo.language()),
             ".yml": Language(tsyaml.language()),
             ".yaml": Language(tsyaml.language()),
             ".md": Language(tsmd.language())
         }
-        self.parser = Parser()
 
     def _get_target_node_types(self, ext: str) -> list[str]:
         if ext == ".py":
             return ["function_definition", "class_definition", "async_function_definition"]
-        elif ext in [".ts", ".js"]:
+        elif ext in [".ts", ".js", ".tsx", ".jsx"]:
             return ["function_declaration", "class_declaration", "method_definition"]
         elif ext == ".go":
             return ["function_declaration", "method_declaration", "type_declaration"]
@@ -55,8 +57,9 @@ class ASTChunker:
         if file_extension not in self.languages:
             raise ValueError(f"Language for extension '{file_extension}' is not supported yet.")
 
-        self.parser.language = self.languages[file_extension]
-        tree = self.parser.parse(bytes(source_code, "utf8"))
+        parser = Parser()
+        parser.language = self.languages[file_extension]
+        tree = parser.parse(bytes(source_code, "utf8"))
         target_types = self._get_target_node_types(file_extension)
         chunks = []
 

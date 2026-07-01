@@ -1,13 +1,14 @@
 import asyncio
-import sys
-import ollama
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from src.db.vector import get_db_client
-from src.db.relational import SessionLocal, ChunkRecord
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from src.core.search import search_skill
+from src.db.relational import SessionLocal, SkillRecord, ChunkRecord, init_relational_db
+from src.db.vector import VectorDBManager
+from src.logger import get_logger
+
+log = get_logger("mcp")
 
 app = Server("vex-memory-hub")
 
@@ -62,6 +63,32 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["tenant_id", "skill_id", "query", "version_a", "version_b"]
             }
+        ),
+        Tool(
+            name="list_skills",
+            description="Lists all registered Vex skills, optionally filtered by tenant. Returns skill IDs, names, and descriptions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Optional tenant ID to filter skills. If omitted, returns all skills."
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_skill_versions",
+            description="Lists all known versions (commit hashes) for a specific skill and tenant.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tenant_id": {"type": "string", "description": "The tenant ID"},
+                    "skill_id": {"type": "string", "description": "The skill ID"}
+                },
+                "required": ["tenant_id", "skill_id"]
+            }
         )
     ]
 
@@ -70,98 +97,98 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """
     Executes logic when an agent invokes the tool.
     """
-    if name not in ["search_vex_skill", "compare_skill_versions"]:
-        raise ValueError(f"Unknown tool: {name}")
-
-    tenant_id = arguments.get("tenant_id")
-    skill_id = arguments.get("skill_id")
-    query = arguments.get("query")
-
     try:
-        enhanced_query = f"source code, function definition, class, method, technical implementation of: {query}"
-        response = ollama.embeddings(model="nomic-embed-text", prompt=enhanced_query)
-        query_vector = response["embedding"]
-        vector_db = get_db_client()
-
-        # Helper to extract heavy text from SQLite
-        def extract_text_from_hits(hits, db_session):
-            if not hits:
-                return "No relevant context found in Vex for this version."
-            results_text = []
-            for hit in hits:
-                record = db_session.query(ChunkRecord).filter(ChunkRecord.chunk_id == str(hit.id)).first()
-                if record:
-                    results_text.append(f"--- File: {record.file_path} ---\n{record.raw_content}\n")
-            return "\n".join(results_text)
-
         if name == "search_vex_skill":
-            search_filter = Filter(
-                must=[
-                    FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
-                    FieldCondition(key="skill_id", match=MatchValue(value=skill_id))
-                ]
+            results = search_skill(
+                tenant_id=arguments["tenant_id"],
+                skill_id=arguments["skill_id"],
+                query=arguments["query"]
             )
-            qdrant_response = vector_db.query_points(
-                collection_name="vex_skills",
-                query=query_vector,
-                query_filter=search_filter,
-                limit=3,
-                score_threshold=0.70  # Umbral de seguridad
-            )
+            if not results:
+                return [TextContent(type="text", text="No relevant context found in Vex for this query.")]
             
-            db = SessionLocal()
-            try:
-                compiled_context = extract_text_from_hits(qdrant_response.points, db)
-                return [TextContent(type="text", text=compiled_context)]
-            finally:
-                db.close()
+            compiled = []
+            for r in results:
+                compiled.append(f"--- File: {r['file_path']} ---\n{r['content']}\n")
+            return [TextContent(type="text", text="\n".join(compiled))]
 
         elif name == "compare_skill_versions":
-            version_a = arguments.get("version_a")
-            version_b = arguments.get("version_b")
+            version_a = arguments["version_a"]
+            version_b = arguments["version_b"]
 
-            # Search Qdrant for a specific version
-            def search_by_version(v: str):
-                v_filter = Filter(
-                    must=[
-                        FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
-                        FieldCondition(key="skill_id", match=MatchValue(value=skill_id)),
-                        FieldCondition(key="version", match=MatchValue(value=v))
-                    ]
-                )
-                res = vector_db.query_points(
-                    collection_name="vex_skills",
-                    query=query_vector,
-                    query_filter=v_filter,
-                    limit=3,
-                    score_threshold=0.70
-                )
-                return res.points
+            results_a = search_skill(
+                tenant_id=arguments["tenant_id"],
+                skill_id=arguments["skill_id"],
+                query=arguments["query"],
+                version=version_a
+            )
+            results_b = search_skill(
+                tenant_id=arguments["tenant_id"],
+                skill_id=arguments["skill_id"],
+                query=arguments["query"],
+                version=version_b
+            )
 
-            hits_a = search_by_version(version_a)
-            hits_b = search_by_version(version_b)
+            def format_results(results):
+                if not results:
+                    return "No relevant context found in Vex for this version."
+                parts = []
+                for r in results:
+                    parts.append(f"--- File: {r['file_path']} ---\n{r['content']}\n")
+                return "\n".join(parts)
 
-            db = SessionLocal()
-            try:
-                context_a = extract_text_from_hits(hits_a, db)
-                context_b = extract_text_from_hits(hits_b, db)
-            finally:
-                db.close()
-
-            # And the story is packaged in such a way that the LLM can cross-reference the variables.
             compiled_context = (
-                f"=== CONTEXT FROM VERSION {version_a} ===\n{context_a}\n\n"
-                f"=== CONTEXT FROM VERSION {version_b} ===\n{context_b}"
+                f"=== CONTEXT FROM VERSION {version_a} ===\n{format_results(results_a)}\n\n"
+                f"=== CONTEXT FROM VERSION {version_b} ===\n{format_results(results_b)}"
             )
             return [TextContent(type="text", text=compiled_context)]
 
+        elif name == "list_skills":
+            db = SessionLocal()
+            try:
+                query = db.query(SkillRecord)
+                tenant_id = arguments.get("tenant_id")
+                if tenant_id:
+                    query = query.filter(SkillRecord.tenant_id == tenant_id)
+                skills = query.all()
+                
+                if not skills:
+                    return [TextContent(type="text", text="No skills found.")]
+                
+                lines = [f"Found {len(skills)} skill(s):\n"]
+                for s in skills:
+                    lines.append(f"- {s.skill_id} | {s.name} | tenant: {s.tenant_id} | {s.description or 'No description'}")
+                return [TextContent(type="text", text="\n".join(lines))]
+            finally:
+                db.close()
+
+        elif name == "get_skill_versions":
+            db = SessionLocal()
+            try:
+                versions = db.query(ChunkRecord.version).filter(
+                    ChunkRecord.tenant_id == arguments["tenant_id"],
+                    ChunkRecord.skill_id == arguments["skill_id"]
+                ).distinct().all()
+                
+                version_list = [v[0] for v in versions]
+                if not version_list:
+                    return [TextContent(type="text", text="No versions found for this skill.")]
+                
+                return [TextContent(type="text", text=f"Available versions ({len(version_list)}): {', '.join(version_list)}")]
+            finally:
+                db.close()
+
+        else:
+            raise ValueError(f"Unknown tool: {name}")
+
     except Exception as e:
+        log.error(f"Error in MCP tool '{name}': {e}")
         return [TextContent(type="text", text=f"Error accessing Vex memory: {str(e)}")]
 
 async def main():
-    # All logging MUST go through stderr. If we do normal print(), 
-    # will corrupt the JSON of stdio and the agent will disconnect.
-    print("[Vex MCP] Starting headless standard I/O server...", file=sys.stderr)
+    log.info("Starting headless standard I/O server...")
+    init_relational_db()
+    VectorDBManager.get_client()
     
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())

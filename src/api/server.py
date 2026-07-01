@@ -1,20 +1,52 @@
 import os
 import uuid
+import hmac
+import hashlib
 import shutil
-import ollama
 import re
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-from src.db.vector import get_db_client, VectorDBManager
+from src.config import ALLOWED_UPLOAD_EXTENSIONS, GITHUB_ALLOWED_REFS, TEMP_UPLOAD_DIR
+from src.db.vector import VectorDBManager
 from src.core.chunker import ast_chunker
-from src.db.relational import init_relational_db, SessionLocal, ChunkRecord, SkillRecord
-from src.api.schemas import DocumentUploadResponse, SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
+from src.core.search import search_skill as _search_skill
+from src.db.relational import init_relational_db, SessionLocal, SkillRecord
+from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload
 from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task
 from src.api.security import verify_api_key
+from src.logger import get_logger
+
+log = get_logger("api")
+
+def _sanitize_filename(filename: str) -> str:
+    """Strip path components and dangerous characters from an uploaded filename."""
+    basename = os.path.basename(filename)
+    return re.sub(r'[^a-zA-Z0-9_.\-]', '_', basename)
+
+async def verify_github_signature(request: Request):
+    """
+    FastAPI dependency that verifies the GitHub webhook HMAC-SHA256 signature.
+    Disabled when VEX_GITHUB_WEBHOOK_SECRET is not set (local development).
+    """
+    secret = os.environ.get("VEX_GITHUB_WEBHOOK_SECRET")
+    if not secret:
+        return
+    
+    signature_header = request.headers.get("X-Hub-Signature-256")
+    if not signature_header:
+        raise HTTPException(status_code=403, detail="Missing X-Hub-Signature-256 header.")
+    
+    body = await request.body()
+    expected_signature = "sha256=" + hmac.new(
+        secret.encode("utf-8"), body, hashlib.sha256
+    ).hexdigest()
+    
+    if not hmac.compare_digest(signature_header, expected_signature):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
 
 # Pydantic schema for the testing endpoint
 class ParseRequest(BaseModel):
@@ -24,15 +56,26 @@ class ParseRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_relational_db()
-    get_db_client()
+    VectorDBManager.get_client()
+    log.info("Vex API started successfully.")
     yield
     VectorDBManager.close()
+    log.info("Vex API shutdown complete.")
 
 app = FastAPI(
     title="Vex API",
     description="Headless Skill Hub for AI Agents",
     version="0.1.0",
     lifespan=lifespan
+)
+
+# CORS middleware — allows cross-origin agent and frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("VEX_CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -43,18 +86,29 @@ async def root():
         "message": "Operating Memory Gateway"
     }
 
-@app.get("/health/db")
-async def db_health():
-    """Verifies if Qdrant is responding."""
+@app.get("/health")
+async def health():
+    """Composite health endpoint — checks both Qdrant and SQLite."""
+    qdrant_health = VectorDBManager.health_check()
+    
+    sqlite_status = "healthy"
     try:
-        client = get_db_client()
-        collections = client.get_collections()
-        return {
-            "status": "healthy",
-            "collections": [c.name for c in collections.collections]
-        }
+        if SessionLocal is not None:
+            db = SessionLocal()
+            db.execute("SELECT 1")
+            db.close()
+        else:
+            sqlite_status = "not_initialized"
     except Exception as e:
-        return {"status": "unhealthy", "message": str(e)}
+        sqlite_status = f"unhealthy: {e}"
+    
+    overall = "healthy" if qdrant_health["status"] == "healthy" and sqlite_status == "healthy" else "degraded"
+    
+    return {
+        "status": overall,
+        "qdrant": qdrant_health,
+        "sqlite": {"status": sqlite_status}
+    }
 
 @app.post("/test/parse")
 async def test_ast_parsing(request: ParseRequest):
@@ -138,10 +192,21 @@ async def upload_document(
     """
     Receives a physical file, saves it temporarily, and dispatches an asynchronous 
     background thread for processing. Returns an immediate 202 Accepted response.
+    Validates file extension against ALLOWED_EXTENSIONS and sanitizes the filename.
     """
-    os.makedirs("temp_uploads", exist_ok=True)
-    filename = file.filename or "unknown_file"
-    temp_path = os.path.join("temp_uploads", filename)
+    raw_filename = file.filename or "unknown_file"
+    safe_filename = _sanitize_filename(raw_filename)
+    ext = os.path.splitext(safe_filename)[1].lower()
+    
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File extension '{ext}' is not supported. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
+        )
+    
+    os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+    unique_filename = f"{uuid.uuid4().hex[:8]}_{safe_filename}"
+    temp_path = os.path.join(TEMP_UPLOAD_DIR, unique_filename)
     
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -156,105 +221,77 @@ async def upload_document(
             "tenant_id": tenant_id,
             "skill_id": skill_id,
             "version": version,
-            "filename": filename
+            "filename": safe_filename
         }
     )
 
 @app.post("/skills/search", response_model=SearchResponse, dependencies=[Depends(verify_api_key)])
-async def search_skill(request: SearchRequest):
+async def search_skill_endpoint(request: SearchRequest):
     """
     Vectorizes the query, searches Qdrant with governance filters, 
     and retrieves the heavy text from SQLite (Pointer Architecture).
+    Delegates to the shared search service.
     """
-    # Vectorize the semantic query
     try:
-        enhanced_query = f"source code, function definition, class, method, technical implementation of: {request.query}"
-        response = ollama.embeddings(model="nomic-embed-text", prompt=enhanced_query)
-        query_vector = response["embedding"]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
-
-    vector_db = get_db_client()
-    must_conditions = [
-        FieldCondition(key="tenant_id", match=MatchValue(value=request.tenant_id)),
-        FieldCondition(key="skill_id", match=MatchValue(value=request.skill_id))
-    ]
-    
-    # If the user or agent requested a specific version, we added it to the mathematical condition.
-    if request.version:
-        must_conditions.append(
-            FieldCondition(key="version", match=MatchValue(value=request.version))
+        results = _search_skill(
+            tenant_id=request.tenant_id,
+            skill_id=request.skill_id,
+            query=request.query,
+            version=request.version,
+            limit=request.limit
         )
-
-    search_filter = Filter(must=must_conditions)
-
-    try:
-        qdrant_response = vector_db.query_points(
-            collection_name="vex_skills",
-            query=query_vector,
-            query_filter=search_filter,
-            limit=request.limit,
-            score_threshold=0.55
-        )
-        # Extract the list of hits from the response wrapper
-        qdrant_results = qdrant_response.points
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Vector database search failed: {str(e)}")
-
-    if not qdrant_results:
-        return SearchResponse(status="success", query=request.query, results=[])
-
-    # Retrieve Heavy Text from Relational DB
-    db = SessionLocal()
-    final_results = []
-    
-    try:
-        for hit in qdrant_results:
-            chunk_id = str(hit.id)
-            # Find the actual text payload using the Qdrant ID
-            record = db.query(ChunkRecord).filter(ChunkRecord.chunk_id == chunk_id).first()
-            
-            if record:
-                final_results.append(
-                    SearchResult(
-                        chunk_id=chunk_id,
-                        file_path=record.file_path,
-                        content=record.raw_content,
-                        score=hit.score
-                    )
-                )
-    finally:
-        db.close()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
     return SearchResponse(
         status="success",
         query=request.query,
-        results=final_results
+        results=[
+            SearchResult(
+                chunk_id=r["chunk_id"],
+                file_path=r["file_path"],
+                content=r["content"],
+                score=r["score"]
+            ) for r in results
+        ]
     )
 
-@app.post("/webhooks/github")
+@app.post("/webhooks/github", dependencies=[Depends(verify_github_signature)])
 async def github_webhook(
     payload: GithubWebhookPayload,
     background_tasks: BackgroundTasks
 ):
     """
-    Receives push events directly from GitHub. 
-    Dynamically assigns tenant_id based on the repository owner.
+    Receives push events directly from GitHub.
+    Verifies HMAC-SHA256 signature, filters by allowed branches,
+    and dynamically assigns tenant_id based on the repository owner.
     """
+    # Branch filter — ignore pushes to non-default branches
+    if payload.ref not in GITHUB_ALLOWED_REFS:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": f"Ignored push to non-default branch: {payload.ref}",
+                "status": "skipped"
+            }
+        )
+    
     repo_name = payload.repository.get("name", "unknown_repo")
     repo_full_name = payload.repository.get("full_name", repo_name)
     
     # (e.g. "facebook/react" -> "facebook" is owner)
     owner_login = payload.repository.get("owner", {}).get("login", "unknown_owner")
     
-    # This clean the string for security before using it in the database
+    # Clean the string for security before using it in the database
     safe_owner = re.sub(r'[^a-zA-Z0-9_\-]', '', owner_login).lower()
     dynamic_tenant_id = f"tnt_gh_{safe_owner}"
     
     processed_commits = []
     
     for commit in payload.commits:
-        commit_hash = commit.id 
+        commit_hash = commit.id
         files_to_download = commit.added + commit.modified
         files_to_delete = commit.removed
 
@@ -262,14 +299,14 @@ async def github_webhook(
         skill_id = f"repo_{repo_name}"
         
         if files_to_download:
-                background_tasks.add_task(
-                    process_github_files_task,
-                    repo_full_name,
-                    commit_hash,
-                    files_to_download,
-                    dynamic_tenant_id, 
-                    skill_id
-                )
+            background_tasks.add_task(
+                process_github_files_task,
+                repo_full_name,
+                commit_hash,
+                files_to_download,
+                dynamic_tenant_id,
+                skill_id
+            )
             
         if files_to_delete:
             for file_path in files_to_delete:
@@ -297,7 +334,7 @@ async def github_webhook(
         }
     )
 
-@app.post("/webhooks/docs")
+@app.post("/webhooks/docs", dependencies=[Depends(verify_api_key)])
 async def docs_webhook(
     payload: DocsWebhookPayload,
     background_tasks: BackgroundTasks

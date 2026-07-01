@@ -1,7 +1,7 @@
 [project]
 name = "vex"
 version = "0.1.0"
-description = "Add your description here"
+description = "Headless skills platform and GitOps engine for agentic memory. Transforms codebases into immutable, versioned cognitive skills with AST segmentation, cryptographic delta updates, and native MCP compatibility."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -20,4 +20,14 @@ dependencies = [
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-yaml>=0.7.2",
     "uvicorn>=0.49.0",
+]
+
+[project.scripts]
+vex = "main:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "httpx>=0.27.0",
+    "pytest-asyncio>=0.24.0",
 ]

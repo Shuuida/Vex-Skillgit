@@ -1,30 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
-class GovernanceInfo(BaseModel):
-    """
-    Pydantic model representing the strict governance boundaries for Vex.
-    Used for type hinting and structural validation.
-    """
-    tenant_id: str = Field(
-        ..., 
-        min_length=3, 
-        description="Unique identifier for the tenant/company."
-    )
-    skill_id: str = Field(
-        ..., 
-        min_length=3, 
-        description="Target skill this knowledge belongs to."
-    )
 
-class DocumentUploadResponse(BaseModel):
-    """
-    Response schema after successfully parsing a document.
-    """
-    status: str
-    message: str
-    total_chunks: int
-    prepared_records: list[dict]
 
 class SkillCreateRequest(BaseModel):
     tenant_id: str = Field(..., min_length=3)
