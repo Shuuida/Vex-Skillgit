@@ -69,7 +69,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware — allows cross-origin agent and frontend access
+# allows cross-origin agent and frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("VEX_CORS_ORIGINS", "*").split(","),
@@ -268,7 +268,6 @@ async def github_webhook(
     Verifies HMAC-SHA256 signature, filters by allowed branches,
     and dynamically assigns tenant_id based on the repository owner.
     """
-    # Branch filter — ignore pushes to non-default branches
     if payload.ref not in GITHUB_ALLOWED_REFS:
         return JSONResponse(
             status_code=200,
