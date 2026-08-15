@@ -1,6 +1,6 @@
 # Vex — Headless Skill Hub for Agentic Memory
 
-> A user-less, GitOps-first skills platform that transforms codebases and documents into immutable, versioned cognitive skills. Built with AST segmentation, cryptographic delta updates, and native MCP compatibility.
+> A user-less, GitOps-first skills platform that transforms codebases and documents into immutable, versioned cognitive skills. Built with AST segmentation, cryptographic delta updates, and native MCP compatibility (Still under active development).
 
 ## Architecture
 
