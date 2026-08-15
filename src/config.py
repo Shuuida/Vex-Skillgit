@@ -13,9 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VEX_DATA_DIR = os.environ.get(
     "VEX_DATA_DIR", str(PROJECT_ROOT / ".vex_data")
 )
-QDRANT_PATH = os.environ.get(
-    "VEX_QDRANT_PATH", str(PROJECT_ROOT / ".qdrant_data")
-)
+QDRANT_URL = os.environ.get("VEX_QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("VEX_QDRANT_API_KEY", None)
 TEMP_UPLOAD_DIR = os.environ.get(
     "VEX_TEMP_DIR", str(PROJECT_ROOT / "temp_uploads")
 )

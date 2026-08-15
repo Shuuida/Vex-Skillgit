@@ -2,7 +2,7 @@ import threading
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
-from src.config import QDRANT_PATH, COLLECTION_NAME, VECTOR_DIMENSION
+from src.config import QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, VECTOR_DIMENSION
 from src.logger import get_logger
 
 log = get_logger("db.vector")
@@ -21,8 +21,8 @@ class VectorDBManager:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    log.info(f"Initializing connection to Qdrant Local on: {QDRANT_PATH}")
-                    cls._instance = QdrantClient(path=QDRANT_PATH)
+                    log.info(f"Initializing connection to Qdrant server on: {QDRANT_URL}")
+                    cls._instance = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60.0)
 
                     if not cls._instance.collection_exists(COLLECTION_NAME):
                         cls._instance.create_collection(

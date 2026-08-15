@@ -14,15 +14,15 @@ Vex uses a **Pointer Architecture** — lightweight vector pointers in Qdrant re
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  FastAPI     │────▶│  Tree-sitter │────▶│   Ollama    │
-│  REST API    │     │  AST Chunker │     │  Embeddings │
+│  FastAPI    │───▶│ Tree-sitter   │───▶│   Ollama    │
+│  REST API   │     │  AST Chunker │     │  Embeddings │
 └──────┬──────┘     └──────────────┘     └──────┬──────┘
        │                                         │
        ▼                                         ▼
-┌─────────────┐                          ┌─────────────┐
-│   SQLite    │◀─── Pointer Architecture ──▶│   Qdrant   │
-│ (Heavy Text)│                          │  (Vectors)   │
-└─────────────┘                          └─────────────┘
+┌─────────────┐                           ┌─────────────┐
+│   SQLite    │◀──Pointer Architecture──▶│   Qdrant    │
+│ (Heavy Text)│                           │  (Vectors)  │
+└─────────────┘                           └─────────────┘
        ▲
        │
 ┌──────┴──────┐
@@ -183,3 +183,4 @@ vex/
 
 ## License
 
+This project is licensed under the Apache License, Version 2.0 - see the LICENSE file for details.

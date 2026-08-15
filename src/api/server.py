@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import shutil
 import re
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -183,7 +183,6 @@ async def get_skill(skill_id: str):
 
 @app.post("/documents/upload", dependencies=[Depends(verify_api_key)])
 async def upload_document(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     tenant_id: str = Form(..., min_length=3),
     skill_id: str = Form(..., min_length=3),
@@ -211,7 +210,7 @@ async def upload_document(
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    background_tasks.add_task(process_ingestion_task, temp_path, tenant_id, skill_id, version)
+    process_ingestion_task(temp_path, tenant_id, skill_id, version)
     
     return JSONResponse(
         status_code=202,
@@ -259,10 +258,7 @@ async def search_skill_endpoint(request: SearchRequest):
     )
 
 @app.post("/webhooks/github", dependencies=[Depends(verify_github_signature)])
-async def github_webhook(
-    payload: GithubWebhookPayload,
-    background_tasks: BackgroundTasks
-):
+async def github_webhook(payload: GithubWebhookPayload):
     """
     Receives push events directly from GitHub.
     Verifies HMAC-SHA256 signature, filters by allowed branches,
@@ -298,8 +294,7 @@ async def github_webhook(
         skill_id = f"repo_{repo_name}"
         
         if files_to_download:
-            background_tasks.add_task(
-                process_github_files_task,
+            process_github_files_task(
                 repo_full_name,
                 commit_hash,
                 files_to_download,
@@ -309,8 +304,7 @@ async def github_webhook(
             
         if files_to_delete:
             for file_path in files_to_delete:
-                background_tasks.add_task(
-                    process_deletion_task,
+                process_deletion_task(
                     file_path,
                     dynamic_tenant_id,
                     skill_id
@@ -334,10 +328,7 @@ async def github_webhook(
     )
 
 @app.post("/webhooks/docs", dependencies=[Depends(verify_api_key)])
-async def docs_webhook(
-    payload: DocsWebhookPayload,
-    background_tasks: BackgroundTasks
-):
+async def docs_webhook(payload: DocsWebhookPayload):
     """
     Receives raw text payloads from documentation platforms.
     Uses the dynamically provided tenant_id from the external system.
@@ -356,8 +347,7 @@ async def docs_webhook(
     
     dynamic_skill_id = f"docs_{payload.source}"
     
-    background_tasks.add_task(
-        process_ingestion_task, 
+    process_ingestion_task( 
         temp_path, 
         dynamic_tenant_id,
         dynamic_skill_id,

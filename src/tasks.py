@@ -5,8 +5,9 @@ import hashlib
 from qdrant_client.models import PointStruct, PointIdsList
 import urllib.request
 import urllib.error
+from huey import SqliteHuey
 
-from src.config import COLLECTION_NAME, TEMP_UPLOAD_DIR
+from src.config import COLLECTION_NAME, TEMP_UPLOAD_DIR, VEX_DATA_DIR
 from src.core.chunker import ast_chunker
 from src.core.search import generate_embedding
 from src.db.vector import get_db_client
@@ -15,7 +16,10 @@ from src.logger import get_logger
 
 log = get_logger("tasks")
 
+queue_file = os.path.join(VEX_DATA_DIR, "vex_queue.db")
+huey = SqliteHuey(filename=queue_file)
 
+@huey.task()
 def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, version: str = "latest"):
     """
     Executes the ingestion pipeline in a background thread.
@@ -125,6 +129,7 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
             os.remove(temp_file_path)
             log.debug("Cleanup: Temporary file removed.")
 
+@huey.task()
 def process_deletion_task(file_path: str, tenant_id: str, skill_id: str):
     """
     Erase the phantom memory of a deleted file on GitHub
@@ -172,6 +177,7 @@ def process_deletion_task(file_path: str, tenant_id: str, skill_id: str):
     finally:
         db.close()
 
+@huey.task()
 def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str):
     """
     Background worker that downloads raw files from GitHub and feeds them 
