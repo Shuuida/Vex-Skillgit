@@ -63,3 +63,8 @@ class DocsWebhookPayload(BaseModel):
     title: str
     content: str
     version_tag: Optional[str] = "latest"
+
+class RollbackRequest(BaseModel):
+    tenant_id: str = Field(..., min_length=3)
+    skill_id: str = Field(..., min_length=3)
+    target_version: str = Field(..., description="The historical commit hash to rollback to")

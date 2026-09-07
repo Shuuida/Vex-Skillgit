@@ -15,8 +15,8 @@ from src.db.vector import VectorDBManager
 from src.core.chunker import ast_chunker
 from src.core.search import search_skill as _search_skill
 from src.db.relational import init_relational_db, SessionLocal, SkillRecord
-from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload
-from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task
+from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload, RollbackRequest
+from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task, process_rollback_task
 from src.api.security import verify_api_key
 from src.logger import get_logger
 
@@ -255,6 +255,28 @@ async def search_skill_endpoint(request: SearchRequest):
                 score=r["score"]
             ) for r in results
         ]
+    )
+
+@app.post("/skills/rollback", dependencies=[Depends(verify_api_key)])
+async def rollback_skill_endpoint(request: RollbackRequest):
+    """
+    Restores a skill's 'latest' memory pointers to a historical target version.
+    Delegates the heavy pointer manipulation to the Huey worker.
+    """
+    process_rollback_task(
+        request.tenant_id,
+        request.skill_id,
+        request.target_version
+    )
+    
+    return JSONResponse(
+        status_code=202,
+        content={
+            "status": "processing_in_background",
+            "message": f"Rollback initiated for skill '{request.skill_id}'.",
+            "tenant_id": request.tenant_id,
+            "target_version": request.target_version
+        }
     )
 
 @app.post("/webhooks/github", dependencies=[Depends(verify_github_signature)])

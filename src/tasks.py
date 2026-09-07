@@ -3,14 +3,16 @@ import re
 import uuid
 import hashlib
 from qdrant_client.models import PointStruct, PointIdsList
+from qdrant_client.http import models
 import urllib.request
 import urllib.error
 from huey import SqliteHuey
+from sqlalchemy import text
 
 from src.config import COLLECTION_NAME, TEMP_UPLOAD_DIR, VEX_DATA_DIR
 from src.core.chunker import ast_chunker
 from src.core.search import generate_embedding
-from src.db.vector import get_db_client
+from src.db.vector import get_db_client, VectorDBManager
 from src.db.relational import SessionLocal, ChunkRecord
 from src.logger import get_logger
 
@@ -211,3 +213,91 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
             log.error(f"Failed to fetch {file_path}. HTTP Error: {e.code}")
         except Exception as e:
             log.error(f"Network error fetching {file_path}: {str(e)}")
+
+@huey.task()
+def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
+    """
+    Executes the cognitive rollback by destroying the current 'latest' pointers 
+    and duplicating the historical target_version as the new 'latest'.
+    """
+    log.info(f"Initiating pointer surgery for {skill_id} (Tenant: {tenant_id}) -> Target: {target_version}")
+    
+    q_client = VectorDBManager.get_client()
+    db = SessionLocal()
+    
+    try:
+        log.info("Step 1: Pruning current 'latest' vectors from Qdrant...")
+        q_client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=models.Filter(
+                must=[
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+                    models.FieldCondition(key="skill_id", match=models.MatchValue(value=skill_id)),
+                    models.FieldCondition(key="version", match=models.MatchValue(value="latest")),
+                ]
+            )
+        )
+        
+        log.info("Step 2: Archiving 'latest' text records in SQLite...")
+        db.execute(
+            text("DELETE FROM chunks WHERE tenant_id = :tenant AND skill_id = :skill AND version = 'latest'"),
+            {"tenant": tenant_id, "skill": skill_id}
+        )
+        db.commit()
+
+        log.info(f"Step 3: Fetching historical vectors for version '{target_version}'...")
+        records, _ = q_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+                    models.FieldCondition(key="skill_id", match=models.MatchValue(value=skill_id)),
+                    models.FieldCondition(key="version", match=models.MatchValue(value=target_version)),
+                ]
+            ),
+            limit=10000,
+            with_payload=True,
+            with_vectors=True
+        )
+
+        if not records:
+            raise ValueError(f"Target version '{target_version}' not found in vector memory.")
+
+        log.info("Step 4: Cloning historical memory into new 'latest' pointers...")
+        new_points = []
+        for record in records:
+            new_payload = record.payload.copy()
+            new_payload["version"] = "latest"
+            
+            new_points.append(
+                models.PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=record.vector,
+                    payload=new_payload
+                )
+            )
+            
+        q_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=new_points
+        )
+
+        db.execute(
+            text("""
+                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash)
+                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, 'latest', file_path, file_extension, ast_node_type, raw_content, chunk_hash
+                FROM chunks
+                WHERE tenant_id = :tenant AND skill_id = :skill AND version = :target
+            """),
+            {"tenant": tenant_id, "skill": skill_id, "target": target_version}
+        )
+        db.commit()
+        
+        log.info(f"SUCCESS: Cognitive rollback complete. {skill_id} is now mirroring {target_version}.")
+        
+    except Exception as e:
+        db.rollback()
+        log.error(f"ERROR during pointer surgery: {str(e)}")
+        raise e
+    finally:
+        db.close()

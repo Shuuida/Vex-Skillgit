@@ -4,6 +4,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from src.core.search import search_skill
+from src.tasks import process_rollback_task
 from src.db.relational import SessionLocal, SkillRecord, ChunkRecord, init_relational_db
 from src.db.vector import VectorDBManager
 from src.logger import get_logger
@@ -88,6 +89,20 @@ async def list_tools() -> list[Tool]:
                     "skill_id": {"type": "string", "description": "The skill ID"}
                 },
                 "required": ["tenant_id", "skill_id"]
+            }
+        ),
+
+        Tool(
+            name="rollback_skill",
+            description="Restores a skill's memory pointers to a historical version. Use this autonomously if the 'latest' code breaks the system or fails tests.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tenant_id": {"type": "string", "description": "The tenant ID"},
+                    "skill_id": {"type": "string", "description": "The skill ID"},
+                    "target_version": {"type": "string", "description": "The historical commit hash to rollback to"}
+                },
+                "required": ["tenant_id", "skill_id", "target_version"]
             }
         )
     ]
@@ -177,6 +192,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text=f"Available versions ({len(version_list)}): {', '.join(version_list)}")]
             finally:
                 db.close()
+
+        elif name == "rollback_skill":
+            tenant_id = arguments["tenant_id"]
+            skill_id = arguments["skill_id"]
+            target_version = arguments["target_version"]
+            
+            process_rollback_task(tenant_id, skill_id, target_version)
+            
+            return [TextContent(
+                type="text", 
+                text=f"✅ Cognitive rollback initiated for skill '{skill_id}' to version '{target_version}'. Background processing started."
+            )]
 
         else:
             raise ValueError(f"Unknown tool: {name}")
