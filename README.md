@@ -88,6 +88,7 @@ The API will be available at `http://localhost:8000`.
 | `GET` | `/skills/{skill_id}` | Yes | Get skill metadata |
 | `POST` | `/documents/upload` | Yes | Upload a file for ingestion |
 | `POST` | `/skills/search` | Yes | Semantic search within a skill |
+| `POST` | `/skills/rollback` | Yes | Restores a skill's memory pointers to a historical target version |
 
 ### Webhook Endpoints
 
@@ -121,6 +122,7 @@ Vex exposes tools via the [Model Context Protocol](https://modelcontextprotocol.
 | `compare_skill_versions` | Compare how code changed between two versions |
 | `list_skills` | List all registered skills (optionally by tenant) |
 | `get_skill_versions` | List available versions for a skill |
+| `rollback_skill` | Restores a skill's memory pointers to a historical version |
 
 ### Running the MCP Server
 
