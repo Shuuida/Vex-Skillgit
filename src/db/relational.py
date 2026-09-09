@@ -47,9 +47,10 @@ class ChunkRecord(Base):
     file_extension = Column(String, nullable=False)
     ast_node_type = Column(String, nullable=False)
     raw_content = Column(Text, nullable=False)
-    version = Column(String, default="latest")
+    version = Column(String, nullable=False, default="latest")
     chunk_hash = Column(String, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    commit_type = Column(String, nullable=False, default="standard")
 
     skill = relationship("SkillRecord", back_populates="chunks")
 

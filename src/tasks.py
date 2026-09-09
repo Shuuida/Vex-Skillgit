@@ -22,12 +22,13 @@ queue_file = os.path.join(VEX_DATA_DIR, "vex_queue.db")
 huey = SqliteHuey(filename=queue_file)
 
 @huey.task()
-def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, version: str = "latest"):
+def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, version: str = "latest", commit_type: str = "standard"):
     """
     Executes the ingestion pipeline in a background thread.
     Handles AST chunking, local vectorization via Ollama, and Pointer Architecture storage.
+    Now includes semantic 'commit_type' classification.
     """
-    log.info(f"Task received. Starting ingestion for {temp_file_path} (Tenant: {tenant_id} | Skill: {skill_id})")
+    log.info(f"Task received. Starting ingestion for {temp_file_path} (Tenant: {tenant_id} | Skill: {skill_id} | Intent: {commit_type})")
     
     db = SessionLocal()
     
@@ -87,7 +88,8 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
                 ast_node_type=chunk["ast_node_type"],
                 raw_content=enriched_content,
                 version=version,
-                chunk_hash=chunk_hash
+                chunk_hash=chunk_hash,
+                commit_type=commit_type
             )
             db.add(record)
             
@@ -100,7 +102,8 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
                     "file_path": filename,
                     "ast_node_type": chunk["ast_node_type"],
                     "version": version,
-                    "dependencies": dependencies
+                    "dependencies": dependencies,
+                    "commit_type": commit_type
                 }
             )
             qdrant_points.append(point)
@@ -180,10 +183,11 @@ def process_deletion_task(file_path: str, tenant_id: str, skill_id: str):
         db.close()
 
 @huey.task()
-def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str):
+def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str, commit_type: str = "standard"):
     """
     Background worker that downloads raw files from GitHub and feeds them 
     into the standard ingestion pipeline.
+    Now receives the commit intent from the webhook.
     """
     log.info(f"Fetching {len(files)} files from GitHub commit {commit_hash}...")
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
@@ -206,8 +210,8 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
             with open(temp_path, "wb") as f:
                 f.write(content)
                 
-            # Feed the downloaded file into our standard vectorization engine
-            process_ingestion_task(temp_path, tenant_id, skill_id, version=commit_hash)
+            # Feed the downloaded file into our standard vectorization engine with the commit intent
+            process_ingestion_task(temp_path, tenant_id, skill_id, version=commit_hash, commit_type=commit_type)
             
         except urllib.error.HTTPError as e:
             log.error(f"Failed to fetch {file_path}. HTTP Error: {e.code}")
@@ -268,6 +272,9 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
         for record in records:
             new_payload = record.payload.copy()
             new_payload["version"] = "latest"
+
+            if "commit_type" not in new_payload:
+                new_payload["commit_type"] = "standard" 
             
             new_points.append(
                 models.PointStruct(
@@ -284,8 +291,8 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
 
         db.execute(
             text("""
-                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash)
-                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, 'latest', file_path, file_extension, ast_node_type, raw_content, chunk_hash
+                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type)
+                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, 'latest', file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type
                 FROM chunks
                 WHERE tenant_id = :tenant AND skill_id = :skill AND version = :target
             """),

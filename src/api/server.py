@@ -19,6 +19,7 @@ from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, Se
 from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task, process_rollback_task
 from src.api.security import verify_api_key
 from src.logger import get_logger
+from src.core.git_parser import parse_commit_intent
 
 log = get_logger("api")
 
@@ -285,6 +286,7 @@ async def github_webhook(payload: GithubWebhookPayload):
     Receives push events directly from GitHub.
     Verifies HMAC-SHA256 signature, filters by allowed branches,
     and dynamically assigns tenant_id based on the repository owner.
+    Parses commit intents to route cognitive tasks natively.
     """
     if payload.ref not in GITHUB_ALLOWED_REFS:
         return JSONResponse(
@@ -314,14 +316,42 @@ async def github_webhook(payload: GithubWebhookPayload):
 
         # The skill will always be associated with this repository
         skill_id = f"repo_{repo_name}"
-        
+        commit_message = getattr(commit, 'message', '')
+        intent = parse_commit_intent(commit_message)
+        log.info(f"Detected commit intent: '{intent}' for hash {commit_hash[:8]}")
+
+        # Infrastructure Operator Routing
+        if intent == "roll":
+            match = re.search(r'roll:.*?([a-f0-9]{7,40})', commit_message.lower())
+            rollback_target = match.group(1) if match else "previous_stable"
+            
+            process_rollback_task(dynamic_tenant_id, skill_id, rollback_target)
+            
+            processed_commits.append({
+                "hash": commit_hash,
+                "action": "rollback",
+                "target": rollback_target
+            })
+            continue # Avoid processing the standard ingest for this commit.
+            
+        elif intent == "branch":
+            log.info("Branching operator detected. Feature pending implementation.")
+            processed_commits.append({
+                "hash": commit_hash,
+                "action": "branch",
+                "status": "pending_implementation"
+            })
+            continue
+
+        # Memory Routing (Standard Ingest)
         if files_to_download:
             process_github_files_task(
                 repo_full_name,
                 commit_hash,
                 files_to_download,
                 dynamic_tenant_id,
-                skill_id
+                skill_id,
+                intent
             )
             
         if files_to_delete:
@@ -334,6 +364,7 @@ async def github_webhook(payload: GithubWebhookPayload):
             
         processed_commits.append({
             "hash": commit_hash,
+            "intent": intent,
             "files_changed": len(files_to_download),
             "files_removed": len(files_to_delete)
         })
