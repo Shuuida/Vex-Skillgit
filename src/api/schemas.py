@@ -68,3 +68,9 @@ class RollbackRequest(BaseModel):
     tenant_id: str = Field(..., min_length=3)
     skill_id: str = Field(..., min_length=3)
     target_version: str = Field(..., description="The historical commit hash to rollback to")
+
+class BranchRequest(BaseModel):
+    tenant_id: str
+    skill_id: str
+    source_version: str = "latest"
+    new_branch_name: str

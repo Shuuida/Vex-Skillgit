@@ -4,7 +4,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from src.core.search import search_skill
-from src.tasks import process_rollback_task
+from src.tasks import process_rollback_task, process_branch_task
 from src.db.relational import SessionLocal, SkillRecord, ChunkRecord, init_relational_db
 from src.db.vector import VectorDBManager
 from src.logger import get_logger
@@ -91,7 +91,6 @@ async def list_tools() -> list[Tool]:
                 "required": ["tenant_id", "skill_id"]
             }
         ),
-
         Tool(
             name="rollback_skill",
             description="Restores a skill's memory pointers to a historical version. Use this autonomously if the 'latest' code breaks the system or fails tests.",
@@ -103,6 +102,23 @@ async def list_tools() -> list[Tool]:
                     "target_version": {"type": "string", "description": "The historical commit hash to rollback to"}
                 },
                 "required": ["tenant_id", "skill_id", "target_version"]
+            }
+        ),
+        Tool(
+            name="branch_vex_memory",
+            description=(
+                "Isolates memory by cloning the vectors of a source version into a new cognitive branch. "
+                "Use this autonomously to create a safe sandbox environment before testing risky code changes or refactors."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tenant_id": {"type": "string", "description": "The tenant ID"},
+                    "skill_id": {"type": "string", "description": "The skill ID"},
+                    "new_branch_name": {"type": "string", "description": "The name of the new isolated branch (e.g., 'feat-auth-refactor')"},
+                    "source_version": {"type": "string", "description": "The version to clone from. Defaults to 'latest'."}
+                },
+                "required": ["tenant_id", "skill_id", "new_branch_name"]
             }
         )
     ]
@@ -203,6 +219,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(
                 type="text", 
                 text=f"✅ Cognitive rollback initiated for skill '{skill_id}' to version '{target_version}'. Background processing started."
+            )]
+
+        elif name == "branch_vex_memory":
+            tenant_id = arguments["tenant_id"]
+            skill_id = arguments["skill_id"]
+            new_branch_name = arguments["new_branch_name"]
+            source_version = arguments.get("source_version", "latest")
+            
+            process_branch_task(tenant_id, skill_id, source_version, new_branch_name)
+            
+            return [TextContent(
+                type="text", 
+                text=f"✅ Cognitive branching initiated. Memory from '{source_version}' is being cloned to '{new_branch_name}' for skill '{skill_id}'."
             )]
 
         else:

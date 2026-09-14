@@ -183,7 +183,7 @@ def process_deletion_task(file_path: str, tenant_id: str, skill_id: str):
         db.close()
 
 @huey.task()
-def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str, commit_type: str = "standard"):
+def process_github_files_task(repo_full_name: str, commit_hash: str, files: list, tenant_id: str, skill_id: str, commit_type: str = "standard", target_version: str = "latest"):
     """
     Background worker that downloads raw files from GitHub and feeds them 
     into the standard ingestion pipeline.
@@ -211,7 +211,7 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
                 f.write(content)
                 
             # Feed the downloaded file into our standard vectorization engine with the commit intent
-            process_ingestion_task(temp_path, tenant_id, skill_id, version=commit_hash, commit_type=commit_type)
+            process_ingestion_task(temp_path, tenant_id, skill_id, version=target_version, commit_type=commit_type)
             
         except urllib.error.HTTPError as e:
             log.error(f"Failed to fetch {file_path}. HTTP Error: {e.code}")
@@ -305,6 +305,78 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
     except Exception as e:
         db.rollback()
         log.error(f"ERROR during pointer surgery: {str(e)}")
+        raise e
+    finally:
+        db.close()
+
+@huey.task()
+def process_branch_task(tenant_id: str, skill_id: str, source_version: str, new_branch_name: str):
+    """
+    Executes Native Cognitive Branching by cloning the memory pointers of a skill
+    into an isolated version environment (fork).
+    """
+    log.info(f"Initiating Cognitive Branching for {skill_id} (Tenant: {tenant_id}) -> Forking '{source_version}' into '{new_branch_name}'")
+    
+    q_client = VectorDBManager.get_client()
+    db = SessionLocal()
+    
+    try:
+        log.info(f"Step 1: Fetching source vectors for version '{source_version}'...")
+        records, _ = q_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+                    models.FieldCondition(key="skill_id", match=models.MatchValue(value=skill_id)),
+                    models.FieldCondition(key="version", match=models.MatchValue(value=source_version)),
+                ]
+            ),
+            limit=10000,
+            with_payload=True,
+            with_vectors=True
+        )
+
+        if not records:
+            log.warning(f"Source version '{source_version}' is empty or missing. Creating an empty branch '{new_branch_name}'.")
+            return
+
+        log.info(f"Step 2: Cloning {len(records)} memory pointers to isolated branch '{new_branch_name}'...")
+        new_points = []
+        
+        for record in records:
+            new_payload = record.payload.copy()
+            new_payload["version"] = new_branch_name
+            
+            new_points.append(
+                models.PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=record.vector, # Cost-free mathematical cloning (zero new vectorization)
+                    payload=new_payload
+                )
+            )
+            
+        q_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=new_points
+        )
+
+        log.info("Step 3: Archiving isolated branch state in SQLite...")
+        db.execute(
+            text("""
+                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type)
+                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, :new_branch, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type
+                FROM chunks
+                WHERE tenant_id = :tenant AND skill_id = :skill AND version = :source
+            """),
+            {"tenant": tenant_id, "skill": skill_id, "new_branch": new_branch_name, "source": source_version}
+        )
+        db.commit()
+        
+        log.info(f"SUCCESS: Branching complete. '{new_branch_name}' is now an isolated cognitive reality.")
+        
+    except Exception as e:
+        db.rollback()
+        log.error(f"ERROR during cognitive branching: {str(e)}")
         raise e
     finally:
         db.close()

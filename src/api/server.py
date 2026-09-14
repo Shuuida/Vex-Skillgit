@@ -15,8 +15,8 @@ from src.db.vector import VectorDBManager
 from src.core.chunker import ast_chunker
 from src.core.search import search_skill as _search_skill
 from src.db.relational import init_relational_db, SessionLocal, SkillRecord
-from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload, RollbackRequest
-from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task, process_rollback_task
+from src.api.schemas import SkillCreateRequest, SkillResponse, SearchRequest, SearchResponse, SearchResult, GithubWebhookPayload, DocsWebhookPayload, RollbackRequest, BranchRequest
+from src.tasks import process_ingestion_task, process_github_files_task, process_deletion_task, process_rollback_task, process_branch_task
 from src.api.security import verify_api_key
 from src.logger import get_logger
 from src.core.git_parser import parse_commit_intent
@@ -280,6 +280,17 @@ async def rollback_skill_endpoint(request: RollbackRequest):
         }
     )
 
+@app.post("/skills/branch", dependencies=[Depends(verify_api_key)])
+async def create_branch_endpoint(request: BranchRequest):
+    """It allows external agents to fork memory directly via API """
+    process_branch_task(
+        request.tenant_id, 
+        request.skill_id, 
+        request.source_version, 
+        request.new_branch_name
+    )
+    return {"status": "processing_in_background", "branch": request.new_branch_name}
+
 @app.post("/webhooks/github", dependencies=[Depends(verify_github_signature)])
 async def github_webhook(payload: GithubWebhookPayload):
     """
@@ -333,13 +344,22 @@ async def github_webhook(payload: GithubWebhookPayload):
                 "target": rollback_target
             })
             continue # Avoid processing the standard ingest for this commit.
+
+        target_version = "latest"
             
-        elif intent == "branch":
-            log.info("Branching operator detected. Feature pending implementation.")
+        if intent == "branch":
+            match = re.search(r'branch:\s*([a-zA-Z0-9_\-]+)', commit_message.lower())
+            new_branch_name = match.group(1) if match else f"branch_{commit_hash[:7]}"
+            
+            # Execute the cloning from "latest" to the new branch
+            process_branch_task(dynamic_tenant_id, skill_id, source_version="latest", new_branch_name=new_branch_name)
+
+            target_version = new_branch_name
             processed_commits.append({
                 "hash": commit_hash,
                 "action": "branch",
-                "status": "pending_implementation"
+                "status": "forked",
+                "new_branch": new_branch_name
             })
             continue
 
@@ -351,7 +371,8 @@ async def github_webhook(payload: GithubWebhookPayload):
                 files_to_download,
                 dynamic_tenant_id,
                 skill_id,
-                intent
+                intent,
+                target_version
             )
             
         if files_to_delete:
