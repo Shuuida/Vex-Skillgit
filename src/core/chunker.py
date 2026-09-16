@@ -53,7 +53,39 @@ class ASTChunker:
         walk(node)
         return list(deps)
 
-    def chunk_source_code(self, source_code: str, file_extension: str) -> list[dict]:
+    def _subchunk_by_lines(self, content: str, chunk_size: int, overlap: int) -> list[str]:
+        """Perform sub-chunking respecting line breaks to avoid breaking code."""
+        lines = content.splitlines(keepends=True)
+        chunks = []
+        current_chunk = ""
+        
+        for line in lines:
+            # If adding this line exceeds the limit (and already has something saved)
+            if len(current_chunk) + len(line) > chunk_size and current_chunk:
+                chunks.append(current_chunk)
+                
+                # Go back for the overlap
+                overlap_buffer = ""
+                for prev_line in reversed(current_chunk.splitlines(keepends=True)):
+                    if len(overlap_buffer) + len(prev_line) <= overlap:
+                        overlap_buffer = prev_line + overlap_buffer
+                    else:
+                        break
+                        
+                current_chunk = overlap_buffer + line
+            else:
+                current_chunk += line
+                
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        return chunks
+
+    def chunk_source_code(self, source_code: str, file_extension: str, chunk_size: int = 1000, overlap: int = 200) -> list[dict]:
+        """
+        Extracts semantic chunks using Tree-sitter AST, and applies memory tuning 
+        to split oversized nodes while respecting the overlap.
+        """
         if file_extension not in self.languages:
             raise ValueError(f"Language for extension '{file_extension}' is not supported yet.")
 
@@ -61,11 +93,12 @@ class ASTChunker:
         parser.language = self.languages[file_extension]
         tree = parser.parse(bytes(source_code, "utf8"))
         target_types = self._get_target_node_types(file_extension)
-        chunks = []
+        
+        extracted_nodes = []
 
         def traverse(node: Node):
             if node.type in target_types:
-                chunks.append({
+                extracted_nodes.append({
                     "ast_node_type": node.type,
                     "content": node.text.decode("utf8"),
                     "start_line": node.start_point[0] + 1,
@@ -77,6 +110,25 @@ class ASTChunker:
                 traverse(child)
 
         traverse(tree.root_node)
-        return chunks
+
+        final_chunks = []
+        for node_data in extracted_nodes:
+            content = node_data["content"]
+            
+            if len(content) > chunk_size:
+                sub_contents = self._subchunk_by_lines(content, chunk_size, overlap)
+                
+                for piece in sub_contents:
+                    final_chunks.append({
+                        "ast_node_type": node_data["ast_node_type"],
+                        "content": piece,
+                        "start_line": node_data["start_line"], # Approximate for the sub-chunk
+                        "end_line": node_data["end_line"],     
+                        "dependencies": node_data["dependencies"]
+                    })
+            else:
+                final_chunks.append(node_data)
+                
+        return final_chunks
 
 ast_chunker = ASTChunker()

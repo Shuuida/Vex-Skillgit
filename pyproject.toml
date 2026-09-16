@@ -11,6 +11,7 @@ dependencies = [
     "ollama>=0.6.2",
     "pydantic>=2.13.4",
     "python-multipart>=0.0.32",
+    "pyyaml>=6.0.3",
     "qdrant-client>=1.18.0",
     "sqlalchemy>=2.0.50",
     "tree-sitter>=0.25.2",

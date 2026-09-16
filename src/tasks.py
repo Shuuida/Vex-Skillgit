@@ -15,6 +15,7 @@ from src.core.search import generate_embedding
 from src.db.vector import get_db_client, VectorDBManager
 from src.db.relational import SessionLocal, ChunkRecord
 from src.logger import get_logger
+from src.core.manifest import SkillManifestParser
 
 log = get_logger("tasks")
 
@@ -22,12 +23,16 @@ queue_file = os.path.join(VEX_DATA_DIR, "vex_queue.db")
 huey = SqliteHuey(filename=queue_file)
 
 @huey.task()
-def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, version: str = "latest", commit_type: str = "standard"):
+def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, version: str = "latest", commit_type: str = "standard", memory_tuning: dict = None):
     """
     Executes the ingestion pipeline in a background thread.
     Handles AST chunking, local vectorization via Ollama, and Pointer Architecture storage.
-    Now includes semantic 'commit_type' classification.
+    Now includes semantic 'commit_type' classification and dynamic memory tuning.
     """
+    memory_tuning = memory_tuning or {}
+    chunk_size = memory_tuning.get("chunk_size", 1000)
+    overlap = memory_tuning.get("overlap", 200)
+
     log.info(f"Task received. Starting ingestion for {temp_file_path} (Tenant: {tenant_id} | Skill: {skill_id} | Intent: {commit_type})")
     
     db = SessionLocal()
@@ -44,9 +49,14 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
         except UnicodeDecodeError:
             raise ValueError("Only UTF-8 encoded text files are supported.")
             
-        # AST Chunking
-        log.info(f"Chunking file {filename} with Tree-sitter...")
-        raw_chunks = ast_chunker.chunk_source_code(source_code, file_extension)
+        log.info(f"Chunking file {filename} with Tree-sitter (Target Size: {chunk_size}, Overlap: {overlap})...")
+        raw_chunks = ast_chunker.chunk_source_code(
+            source_code, 
+            file_extension, 
+            chunk_size=chunk_size, 
+            overlap=overlap
+        )
+        
         log.info(f"Extracted {len(raw_chunks)} chunks. Generating embeddings...")
 
         vector_db = get_db_client()
@@ -192,6 +202,21 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
     log.info(f"Fetching {len(files)} files from GitHub commit {commit_hash}...")
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
 
+    manifest_config = {}
+    if "SKILLS.yaml" in files:
+        raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{commit_hash}/SKILLS.yaml"
+        try:
+            log.info("SKILLS.yaml detected. Parsing cognitive manifest...")
+            req = urllib.request.Request(raw_url)
+            with urllib.request.urlopen(req) as response:
+                yaml_content = response.read().decode('utf-8')
+                
+            parser = SkillManifestParser(yaml_content)
+            manifest_config = parser.auto_register_skills(tenant_id) 
+            
+        except Exception as e:
+            log.error(f"Failed to parse SKILLS.yaml: {e}")
+
     for file_path in files:
         # Construct the raw GitHub URL
         raw_url = f"https://raw.githubusercontent.com/{repo_full_name}/{commit_hash}/{file_path}"
@@ -210,8 +235,43 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
             with open(temp_path, "wb") as f:
                 f.write(content)
                 
-            # Feed the downloaded file into our standard vectorization engine with the commit intent
-            process_ingestion_task(temp_path, tenant_id, skill_id, version=target_version, commit_type=commit_type)
+            if manifest_config:
+                # Iterate over each skill defined in the SKILLS.yaml
+                for manifest_skill_id, config in manifest_config.items():
+                    boundaries = config.get("context_boundaries", {})
+                    includes = boundaries.get("include_extensions", [])
+                    excludes = boundaries.get("exclude_paths", [])
+                    
+                    # Exclusion filter (e.g. discard /backend or .sql)
+                    is_excluded = any(ex.replace("*", "") in file_path for ex in excludes)
+                    if is_excluded:
+                        continue
+                        
+                    # Inclusion filter (e.g. only .vue and .ts)
+                    # If no 'includes' are defined, accept everything by default
+                    is_included = not includes or any(file_path.endswith(ext) for ext in includes)
+                    
+                    if is_included:
+                        log.info(f"Routing {filename} to the skill '{manifest_skill_id}'...")
+                        tuning = config.get("memory_tuning", {})
+                        # Ingest the file into the specific skill
+                        process_ingestion_task(
+                            temp_path, 
+                            tenant_id,
+                            skill_id=manifest_skill_id,
+                            version=target_version, 
+                            commit_type=commit_type,
+                            memory_tuning=tuning
+                        )
+            else:
+                # Fallback: Legacy behavior (1 Repo = 1 Skill) if SKILLS.yaml does not exist
+                process_ingestion_task(
+                    temp_path, 
+                    tenant_id, 
+                    skill_id=skill_id, 
+                    version=target_version, 
+                    commit_type=commit_type
+                )
             
         except urllib.error.HTTPError as e:
             log.error(f"Failed to fetch {file_path}. HTTP Error: {e.code}")
