@@ -242,19 +242,19 @@ def process_github_files_task(repo_full_name: str, commit_hash: str, files: list
                     includes = boundaries.get("include_extensions", [])
                     excludes = boundaries.get("exclude_paths", [])
                     
-                    # Exclusion filter (e.g. discard /backend or .sql)
+                    allowed_commits = boundaries.get("include_commits", [])
                     is_excluded = any(ex.replace("*", "") in file_path for ex in excludes)
                     if is_excluded:
                         continue
                         
-                    # Inclusion filter (e.g. only .vue and .ts)
-                    # If no 'includes' are defined, accept everything by default
                     is_included = not includes or any(file_path.endswith(ext) for ext in includes)
+                    is_allowed_commit = not allowed_commits or commit_type in allowed_commits
                     
-                    if is_included:
-                        log.info(f"Routing {filename} to the skill '{manifest_skill_id}'...")
+                    # It only routes if it passes the file and commit validations
+                    if is_included and is_allowed_commit:
+                        log.info(f"Routing {filename} to '{manifest_skill_id}' (Intent: {commit_type})...")
                         tuning = config.get("memory_tuning", {})
-                        # Ingest the file into the specific skill
+                        
                         process_ingestion_task(
                             temp_path, 
                             tenant_id,
