@@ -255,6 +255,31 @@ vex/
 │       └── server.py        # MCP stdio server for AI agents
 ```
 
+## Local Development Watcher (Zero-Git)
+
+For developers working locally who want real-time agentic memory without setting up GitHub webhooks or exposing ports, Vex includes a local file watcher. It mirrors your active hard drive changes directly into Qdrant in milliseconds.
+
+### Activation
+
+Ensure your FastAPI server and Huey worker are running. Then, open a new terminal in your project directory and start the watcher:
+
+```bash
+uv run python -m src.cli.watcher --path . --skill my-local-workspace
+
+```
+
+Every time you save a file (`Ctrl+S`), the watcher detects the OS-level event and queues the file for immediate background ingestion.
+
+### Database Synchronization & Deterministic Upserts
+
+The local watcher is engineered to handle continuous local edits, undo actions, and local Git time-travel (e.g., `git reset --hard` or `git checkout HEAD~1`) without duplicating or corrupting the agent's memory.
+
+1. **Heuristic Intent Inference:** Because OS file saves lack explicit Git commit messages, the watcher heuristically infers the semantic intent based on the file extension and path (e.g., `.md` triggers a `docs` intent; standard code files trigger a `fix` intent).
+2. **Deterministic UUIDs:** When the Huey worker processes the file through the Tree-sitter AST chunker, it generates a strict, deterministic mathematical hash (UUID) for every chunk based on the `tenant_id`, `skill_id`, `file_path`, and `chunk_index`.
+3. **Silent Upserts:** The resulting vectors are sent to Qdrant. Because the UUIDs for a specific file chunk remain mathematically constant across saves, Qdrant detects the ID collision and performs a clean **Upsert** (Update/Insert).
+
+Instead of creating duplicate context windows, Vex silently overwrites the old vectors with the new weights. If a developer breaks the code and uses Git to revert to a previous functional state, the watcher immediately detects the file change and overwrites Qdrant with the restored code, ensuring the AI agent's memory is always a perfect, non-hallucinated mirror of the developer's active screen.
+
 ## License
 
 This project is licensed under the Apache License, Version 2.0 - see the LICENSE file for details.
