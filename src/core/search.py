@@ -1,5 +1,5 @@
-import time
-import ollama
+import asyncio
+from ollama import AsyncClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from src.config import (
@@ -14,33 +14,35 @@ from src.logger import get_logger
 log = get_logger("search")
 
 
-def generate_embedding(text: str) -> list[float]:
+async def generate_embedding(text: str) -> list[float]:
     """
-    Generate an embedding vector for the given text using the configured model.
-    Includes retry logic with exponential backoff for resilience against
-    transient Ollama failures.
+    Generate a vector asynchronously so as not to block the FastAPI Event Loop.
+    Use asyncio.sleep for exponential backoff.
     """
     last_error = None
+    client = AsyncClient()
+    
     for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
         try:
-            response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=text)
+            response = await client.embeddings(model=EMBEDDING_MODEL, prompt=text)
             return response["embedding"]
         except Exception as e:
             last_error = e
             if attempt < EMBEDDING_MAX_RETRIES:
                 delay = EMBEDDING_RETRY_DELAY * (2 ** (attempt - 1))
                 log.warning(f"Embedding attempt {attempt}/{EMBEDDING_MAX_RETRIES} failed: {e}. Retrying in {delay}s...")
-                time.sleep(delay)
+                await asyncio.sleep(delay)
+                
     raise RuntimeError(f"Embedding generation failed after {EMBEDDING_MAX_RETRIES} attempts: {last_error}")
 
 
-def search_skill(tenant_id: str, skill_id: str, query: str, version: str | None = None, limit: int = DEFAULT_SEARCH_LIMIT, score_threshold: float = SCORE_THRESHOLD) -> list[dict]:
+async def search_skill(tenant_id: str, skill_id: str, query: str, version: str | None = None, limit: int = DEFAULT_SEARCH_LIMIT, score_threshold: float = SCORE_THRESHOLD) -> list[dict]:
     """
-    Unified search pipeline: vectorize query → search Qdrant → dereference pointers via SQLite.
-    Returns a list of dicts with keys: chunk_id, file_path, content, score.
+    Unified and asynchronous search pipeline.
+    Optimized to avoid N+1 queries in SQLite and audit the pointer invariant.
     """
     enhanced_query = f"{QUERY_ENHANCEMENT_PREFIX} {query}"
-    query_vector = generate_embedding(enhanced_query)
+    query_vector = await generate_embedding(enhanced_query)
     
     vector_db = get_db_client()
     must_conditions = [
@@ -67,14 +69,18 @@ def search_skill(tenant_id: str, skill_id: str, query: str, version: str | None 
     if not qdrant_results:
         return []
     
-    # Pointer Architecture: dereference Qdrant IDs → SQLite heavy text
     db = SessionLocal()
     results = []
     
     try:
+        point_ids = [str(hit.id) for hit in qdrant_results]
+        
+        records = db.query(ChunkRecord).filter(ChunkRecord.chunk_id.in_(point_ids)).all()
+        record_map = {record.chunk_id: record for record in records}
+        
         for hit in qdrant_results:
             chunk_id = str(hit.id)
-            record = db.query(ChunkRecord).filter(ChunkRecord.chunk_id == chunk_id).first()
+            record = record_map.get(chunk_id)
             
             if record:
                 results.append({
@@ -83,6 +89,9 @@ def search_skill(tenant_id: str, skill_id: str, query: str, version: str | None 
                     "content": record.raw_content,
                     "score": hit.score
                 })
+            else:
+                log.error(f"Orphan vector detected: The vector '{chunk_id}' exists in Qdrant but SQLite does not have the source text.")
+                
     finally:
         db.close()
     

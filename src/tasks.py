@@ -8,6 +8,7 @@ import urllib.request
 import urllib.error
 from huey import SqliteHuey
 from sqlalchemy import text
+import asyncio
 
 from src.config import COLLECTION_NAME, TEMP_UPLOAD_DIR, VEX_DATA_DIR
 from src.core.chunker import ast_chunker
@@ -87,7 +88,7 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
                 log.info(f"Delta Match: Skipping vectorization. Perfect cache hit for hash {chunk_hash[:8]}. Skipping entirely")
                 continue
 
-            vector_data = generate_embedding(chunk_content)
+            vector_data = asyncio.run(generate_embedding(chunk_content))
             
             record = ChunkRecord(
                 chunk_id=pointer_id,
@@ -118,20 +119,23 @@ def process_ingestion_task(temp_file_path: str, tenant_id: str, skill_id: str, v
             )
             qdrant_points.append(point)
 
-        log.info(f"Upserting {len(qdrant_points)} vectors to Qdrant...")
-        vector_db.upsert(collection_name=COLLECTION_NAME, points=qdrant_points)
-        
-        log.info(f"Committing {len(raw_chunks)} records to SQLite...")
-        try:
-            db.commit()
-        except Exception:
-            point_ids = [p.id for p in qdrant_points]
-            vector_db.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=PointIdsList(points=point_ids)
-            )
-            raise
-        
+        if qdrant_points:
+            log.info(f"Upserting {len(qdrant_points)} vectors to Qdrant...")
+            vector_db.upsert(collection_name=COLLECTION_NAME, points=qdrant_points)
+            
+            log.info(f"Committing {len(qdrant_points)} new records to SQLite...")
+            try:
+                db.commit()
+            except Exception:
+                point_ids = [p.id for p in qdrant_points]
+                vector_db.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=models.PointIdsList(points=point_ids)
+                )
+                raise
+        else:
+            log.info("SUCCESS: 0 new vectors generated. Perfect cache match. Skipping database writes.")
+
         log.info("SUCCESS: Vectorization complete. Memory committed to Vex.")
         
     except Exception as e:
@@ -283,6 +287,7 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
     """
     Executes the cognitive rollback by destroying the current 'latest' pointers 
     and duplicating the historical target_version as the new 'latest'.
+    Fixes the invisible clones bug by enforcing a single shared UUID per chunk.
     """
     log.info(f"Initiating pointer surgery for {skill_id} (Tenant: {tenant_id}) -> Target: {target_version}")
     
@@ -290,7 +295,27 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
     db = SessionLocal()
     
     try:
-        log.info("Step 1: Pruning current 'latest' vectors from Qdrant...")
+        log.info(f"Step 1: Validating existence of target version '{target_version}'...")
+        source_records = db.query(ChunkRecord).filter(
+            ChunkRecord.tenant_id == tenant_id,
+            ChunkRecord.skill_id == skill_id,
+            ChunkRecord.version == target_version
+        ).all()
+
+        if not source_records:
+            log.error(f"[Rollback Aborted] Target version '{target_version}' not found in SQLite.")
+            return
+
+        point_ids = [record.chunk_id for record in source_records]
+        q_records = q_client.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=point_ids,
+            with_vectors=True,
+            with_payload=True
+        )
+        vector_map = {pt.id: pt for pt in q_records}
+
+        log.info("Step 2: Pruning current 'latest' vectors and text records...")
         q_client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=models.Filter(
@@ -302,64 +327,59 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
             )
         )
         
-        log.info("Step 2: Archiving 'latest' text records in SQLite...")
-        db.execute(
-            text("DELETE FROM chunks WHERE tenant_id = :tenant AND skill_id = :skill AND version = 'latest'"),
-            {"tenant": tenant_id, "skill": skill_id}
-        )
-        db.commit()
+        db.query(ChunkRecord).filter(
+            ChunkRecord.tenant_id == tenant_id,
+            ChunkRecord.skill_id == skill_id,
+            ChunkRecord.version == "latest"
+        ).delete(synchronize_session=False)
 
-        log.info(f"Step 3: Fetching historical vectors for version '{target_version}'...")
-        records, _ = q_client.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-                    models.FieldCondition(key="skill_id", match=models.MatchValue(value=skill_id)),
-                    models.FieldCondition(key="version", match=models.MatchValue(value=target_version)),
-                ]
-            ),
-            limit=10000,
-            with_payload=True,
-            with_vectors=True
-        )
+        log.info("Step 3: Cloning historical memory into new 'latest' pointers with shared UUIDs...")
+        new_qdrant_points = []
+        new_db_records = []
 
-        if not records:
-            raise ValueError(f"Target version '{target_version}' not found in vector memory.")
-
-        log.info("Step 4: Cloning historical memory into new 'latest' pointers...")
-        new_points = []
-        for record in records:
-            new_payload = record.payload.copy()
-            new_payload["version"] = "latest"
-
-            if "commit_type" not in new_payload:
-                new_payload["commit_type"] = "standard" 
+        for record in source_records:
+            if record.chunk_id not in vector_map:
+                log.warning(f"Orphaned record found: {record.chunk_id} missing in Qdrant. Skipping.")
+                continue
             
-            new_points.append(
+            shared_id = str(uuid.uuid4())
+            q_point = vector_map[record.chunk_id]
+            
+            new_payload = q_point.payload.copy() if q_point.payload else {}
+            new_payload["version"] = "latest"
+            if "commit_type" not in new_payload:
+                new_payload["commit_type"] = record.commit_type or "standard"
+                
+            new_qdrant_points.append(
                 models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=record.vector,
+                    id=shared_id,
+                    vector=q_point.vector,
                     payload=new_payload
                 )
             )
             
-        q_client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=new_points
-        )
+            new_db_records.append(
+                ChunkRecord(
+                    chunk_id=shared_id,
+                    tenant_id=record.tenant_id,
+                    skill_id=record.skill_id,
+                    file_path=record.file_path,
+                    file_extension=record.file_extension,
+                    ast_node_type=record.ast_node_type,
+                    raw_content=record.raw_content,
+                    version="latest",
+                    chunk_hash=record.chunk_hash,
+                    commit_type=record.commit_type
+                )
+            )
 
-        db.execute(
-            text("""
-                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type)
-                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, 'latest', file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type
-                FROM chunks
-                WHERE tenant_id = :tenant AND skill_id = :skill AND version = :target
-            """),
-            {"tenant": tenant_id, "skill": skill_id, "target": target_version}
-        )
-        db.commit()
+        if new_qdrant_points:
+            q_client.upsert(collection_name=COLLECTION_NAME, points=new_qdrant_points)
         
+        if new_db_records:
+            db.add_all(new_db_records)
+            db.commit()
+            
         log.info(f"SUCCESS: Cognitive rollback complete. {skill_id} is now mirroring {target_version}.")
         
     except Exception as e:
@@ -369,11 +389,13 @@ def process_rollback_task(tenant_id: str, skill_id: str, target_version: str):
     finally:
         db.close()
 
+
 @huey.task()
 def process_branch_task(tenant_id: str, skill_id: str, source_version: str, new_branch_name: str):
     """
     Executes Native Cognitive Branching by cloning the memory pointers of a skill
-    into an isolated version environment (fork).
+    into an isolated version environment (fork) using synchronized UUIDs.
+    Includes collision prevention to mimic 'git checkout -b' strict behavior.
     """
     log.info(f"Initiating Cognitive Branching for {skill_id} (Tenant: {tenant_id}) -> Forking '{source_version}' into '{new_branch_name}'")
     
@@ -381,58 +403,82 @@ def process_branch_task(tenant_id: str, skill_id: str, source_version: str, new_
     db = SessionLocal()
     
     try:
-        log.info(f"Step 1: Fetching source vectors for version '{source_version}'...")
-        records, _ = q_client.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-                    models.FieldCondition(key="skill_id", match=models.MatchValue(value=skill_id)),
-                    models.FieldCondition(key="version", match=models.MatchValue(value=source_version)),
-                ]
-            ),
-            limit=10000,
-            with_payload=True,
-            with_vectors=True
-        )
+        branch_exists = db.query(ChunkRecord).filter(
+            ChunkRecord.tenant_id == tenant_id,
+            ChunkRecord.skill_id == skill_id,
+            ChunkRecord.version == new_branch_name
+        ).first()
 
-        if not records:
+        if branch_exists:
+            log.error(f"[Branch Aborted] Branch '{new_branch_name}' already exists in memory. To update it, use standard commits or delete it first.")
+            return False
+
+        source_records = db.query(ChunkRecord).filter(
+            ChunkRecord.tenant_id == tenant_id,
+            ChunkRecord.skill_id == skill_id,
+            ChunkRecord.version == source_version
+        ).all()
+
+        if not source_records:
             log.warning(f"Source version '{source_version}' is empty or missing. Creating an empty branch '{new_branch_name}'.")
             return
 
-        log.info(f"Step 2: Cloning {len(records)} memory pointers to isolated branch '{new_branch_name}'...")
-        new_points = []
+        log.info(f"Step 1: Fetching source vectors for version '{source_version}'...")
+        point_ids = [record.chunk_id for record in source_records]
+        q_records = q_client.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=point_ids,
+            with_vectors=True,
+            with_payload=True
+        )
+        vector_map = {pt.id: pt for pt in q_records}
+
+        log.info(f"Step 2: Cloning {len(source_records)} memory pointers to isolated branch '{new_branch_name}'...")
+        new_qdrant_points = []
+        new_db_records = []
         
-        for record in records:
-            new_payload = record.payload.copy()
+        for record in source_records:
+            if record.chunk_id not in vector_map:
+                continue
+                
+            shared_id = str(uuid.uuid4())
+            q_point = vector_map[record.chunk_id]
+            
+            new_payload = q_point.payload.copy() if q_point.payload else {}
             new_payload["version"] = new_branch_name
             
-            new_points.append(
+            new_qdrant_points.append(
                 models.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=record.vector, # Cost-free mathematical cloning (zero new vectorization)
+                    id=shared_id,
+                    vector=q_point.vector, 
                     payload=new_payload
                 )
             )
             
-        q_client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=new_points
-        )
-
-        log.info("Step 3: Archiving isolated branch state in SQLite...")
-        db.execute(
-            text("""
-                INSERT INTO chunks (chunk_id, tenant_id, skill_id, version, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type)
-                SELECT lower(hex(randomblob(16))), tenant_id, skill_id, :new_branch, file_path, file_extension, ast_node_type, raw_content, chunk_hash, commit_type
-                FROM chunks
-                WHERE tenant_id = :tenant AND skill_id = :skill AND version = :source
-            """),
-            {"tenant": tenant_id, "skill": skill_id, "new_branch": new_branch_name, "source": source_version}
-        )
-        db.commit()
+            new_db_records.append(
+                ChunkRecord(
+                    chunk_id=shared_id,
+                    tenant_id=record.tenant_id,
+                    skill_id=record.skill_id,
+                    file_path=record.file_path,
+                    file_extension=record.file_extension,
+                    ast_node_type=record.ast_node_type,
+                    raw_content=record.raw_content,
+                    version=new_branch_name,
+                    chunk_hash=record.chunk_hash,
+                    commit_type=record.commit_type
+                )
+            )
+            
+        if new_qdrant_points:
+            q_client.upsert(collection_name=COLLECTION_NAME, points=new_qdrant_points)
+            
+        if new_db_records:
+            db.add_all(new_db_records)
+            db.commit()
         
         log.info(f"SUCCESS: Branching complete. '{new_branch_name}' is now an isolated cognitive reality.")
+        return True
         
     except Exception as e:
         db.rollback()
